@@ -9,7 +9,7 @@ use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 use crate::{
-    AniError, Result, StreamLink, relay_stream, relay_stream_without_hls_subtitles,
+    AniError, Result, StreamLink, SubtitleTrack, relay_stream, relay_stream_without_hls_subtitles,
     requires_hls_relay,
 };
 
@@ -175,7 +175,9 @@ impl Player {
                     args.push(format!("--referrer={referer}"));
                 }
                 append_mpv_headers(&mut args, stream);
-                for track in &stream.subtitles {
+                let mut subtitles: Vec<&SubtitleTrack> = stream.subtitles.iter().collect();
+                subtitles.sort_by_key(|track| track.default);
+                for track in subtitles {
                     args.push(format!("--sub-file={}", track.url));
                 }
                 args
@@ -576,11 +578,14 @@ fn mpv_options(stream: &StreamLink, title: &str, referer: &str) -> Vec<String> {
         args.push(format!("--referrer={referer}"));
     }
     append_mpv_headers(&mut args, stream);
-    for track in &stream.subtitles {
+    // mpv titles external subtitle tracks after the URL basename, so relayed
+    // tracks already display their language. It also selects the most
+    // recently added external track, so the provider's default track is
+    // appended last to become the initially selected one.
+    let mut subtitles: Vec<&SubtitleTrack> = stream.subtitles.iter().collect();
+    subtitles.sort_by_key(|track| track.default);
+    for track in subtitles {
         args.push(format!("--sub-file={}", track.url));
-    }
-    if let Some(track) = stream.subtitles.iter().find(|track| track.default) {
-        args.push(format!("--slang={}", track.label));
     }
     // Add cache settings for HLS relay streams
     if stream.hls && requires_hls_relay(stream) {
@@ -655,6 +660,53 @@ mod tests {
     }
 
     #[test]
+    fn mpv_appends_the_default_subtitle_last() {
+        let player = Player::new(PlayerOptions {
+            executable: "mpv".into(),
+            kind: PlayerKind::Mpv,
+            no_detach: true,
+            exit_after_play: false,
+            force_hls_relay: false,
+        });
+        let stream = StreamLink {
+            url: "https://media/a.m3u8".into(),
+            resolution: "1080p".into(),
+            hls: true,
+            provider: "Default".into(),
+            downloadable: true,
+            headers: RequestHeaders::default(),
+            subtitles: vec![
+                SubtitleTrack {
+                    label: "Arabic".into(),
+                    url: "http://127.0.0.1:1/r/one/Arabic".into(),
+                    default: false,
+                },
+                SubtitleTrack {
+                    label: "English".into(),
+                    url: "http://127.0.0.1:1/r/two/English".into(),
+                    default: true,
+                },
+                SubtitleTrack {
+                    label: "Spanish".into(),
+                    url: "http://127.0.0.1:1/r/three/Spanish".into(),
+                    default: false,
+                },
+            ],
+        };
+        let args = player.command_args(&stream, "Anime");
+        let sub_files: Vec<&String> = args
+            .iter()
+            .filter(|arg| arg.starts_with("--sub-file="))
+            .collect();
+        assert_eq!(sub_files.len(), 3);
+        assert!(sub_files[0].ends_with("/Arabic"));
+        assert!(sub_files[1].ends_with("/Spanish"));
+        // mpv selects the most recently added external track, so the default
+        // language has to be the final --sub-file argument.
+        assert!(sub_files[2].ends_with("/English"));
+    }
+
+    #[test]
     fn iina_arguments_put_stream_before_raw_mpv_options() {
         let player = Player::new(PlayerOptions {
             executable: "iina".into(),
@@ -692,7 +744,6 @@ mod tests {
                 "--referrer=https://ref.example",
                 "--http-header-fields=Origin: https://origin.example",
                 "--sub-file=https://media/subtitles.vtt",
-                "--slang=English",
                 // The stream carries provider browser context, so it is
                 // relayed and receives the HLS relay cache settings.
                 "--cache=yes",

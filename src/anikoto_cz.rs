@@ -20,6 +20,8 @@ use crate::{
 
 const DEFAULT_BASE: &str = "https://anikoto.cz";
 const DEFAULT_MAPPER_BASE: &str = "https://mapper.nekostream.site/api/mal";
+const DEFAULT_ANILIST_API: &str = "https://graphql.anilist.co";
+const MAX_ANILIST_LOOKUPS: usize = 20;
 const DEFAULT_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36";
 const CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const CACHE_LIMIT: usize = 100;
@@ -68,6 +70,7 @@ struct Cached<T> {
 pub struct AnikotoCzClientBuilder {
     base: String,
     mapper_base: String,
+    anilist_api: String,
     user_agent: String,
     timeout: Duration,
 }
@@ -77,6 +80,7 @@ impl Default for AnikotoCzClientBuilder {
         Self {
             base: DEFAULT_BASE.into(),
             mapper_base: DEFAULT_MAPPER_BASE.into(),
+            anilist_api: DEFAULT_ANILIST_API.into(),
             user_agent: DEFAULT_AGENT.into(),
             timeout: Duration::from_secs(15),
         }
@@ -91,6 +95,14 @@ impl AnikotoCzClientBuilder {
 
     pub fn mapper_base(mut self, value: impl Into<String>) -> Self {
         self.mapper_base = value.into();
+        self
+    }
+
+    /// Overrides the AniList GraphQL endpoint used to enrich search results
+    /// with episode counts. Anikoto.cz search markup does not expose episode
+    /// counts, so they are looked up in batch from AniList.
+    pub fn anilist_api(mut self, value: impl Into<String>) -> Self {
+        self.anilist_api = value.into();
         self
     }
 
@@ -111,6 +123,7 @@ impl AnikotoCzClientBuilder {
                 http,
                 base: self.base.trim_end_matches('/').into(),
                 mapper_base: self.mapper_base.trim_end_matches('/').into(),
+                anilist_api: self.anilist_api.trim_end_matches('/').into(),
                 user_agent: self.user_agent,
                 series: Mutex::new(HashMap::new()),
                 source_keys: Mutex::new(None),
@@ -123,6 +136,7 @@ struct Inner {
     http: Client,
     base: String,
     mapper_base: String,
+    anilist_api: String,
     user_agent: String,
     series: Mutex<HashMap<String, Cached<Series>>>,
     source_keys: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
@@ -199,15 +213,72 @@ impl AnikotoCzClient {
                 }
             };
 
-            let results = parse_search(&self.inner.base, &html)?;
-            if !results.is_empty() {
-                return Ok(results);
+            let mut shows = parse_search(&self.inner.base, &html)?;
+            if !shows.is_empty() {
+                self.enrich_episode_counts(&mut shows).await;
+                return Ok(shows.into_iter().map(|show| show.result).collect());
             }
         }
 
         Err(AniError::Provider(format!(
             "Anikoto.cz returned no search results for {query:?}"
         )))
+    }
+
+    /// Anikoto.cz search markup carries no episode counts, so the displayed
+    /// counts are looked up from AniList in a single aliased GraphQL request.
+    /// The romaji title (`data-jp`) is preferred for matching because AniList
+    /// indexes romaji titles; failures fall back to the displayed title, and
+    /// any request failure simply leaves the previous counts untouched.
+    async fn enrich_episode_counts(&self, shows: &mut [ParsedShow]) {
+        let lookups = shows.len().min(MAX_ANILIST_LOOKUPS);
+        if lookups == 0 {
+            return;
+        }
+        let mut fields = String::new();
+        for (index, show) in shows.iter().take(lookups).enumerate() {
+            let Ok(search) = serde_json::to_string(
+                show.romaji
+                    .as_deref()
+                    .unwrap_or(show.result.name.as_str())
+                    .trim(),
+            ) else {
+                continue;
+            };
+            fields.push_str(&format!(
+                "m{index}: Page(page: 1, perPage: 1) {{ media(type: ANIME, search: {search}, sort: SEARCH_MATCH) {{ episodes }} }}"
+            ));
+        }
+        let query = format!("query {{ {fields} }}");
+        let request = self
+            .inner
+            .http
+            .post(&self.inner.anilist_api)
+            .header(header::REFERER, "https://anilist.co/")
+            .json(&serde_json::json!({ "query": query }));
+        let Ok(response) = request.send().await else {
+            return;
+        };
+        if !response.status().is_success() {
+            return;
+        }
+        let Ok(payload) = response.json::<Value>().await else {
+            return;
+        };
+        let Some(data) = payload.get("data") else {
+            return;
+        };
+        for (index, show) in shows.iter_mut().enumerate().take(lookups) {
+            let episodes = data
+                .pointer(&format!("/m{index}/media"))
+                .and_then(Value::as_array)
+                .and_then(|media| media.first())
+                .and_then(|media| media.get("episodes"))
+                .and_then(Value::as_u64);
+            if let Some(count) = episodes.filter(|count| *count > 0) {
+                show.result.episodes = count as f64;
+            }
+        }
     }
 
     pub async fn episodes(&self, show_id: &str, mode: TranslationType) -> Result<Vec<String>> {
@@ -677,7 +748,14 @@ fn filter_search_urls(query: &str) -> Vec<String> {
     filter_search_urls_for_base("https://anikoto.cz", query, None)
 }
 
-fn parse_search(base: &str, html: &str) -> Result<Vec<SearchResult>> {
+/// A parsed Anikoto.cz search hit, with the romaji title AniList indexes
+/// (`data-jp`) kept alongside the catalog result for episode-count lookups.
+struct ParsedShow {
+    result: SearchResult,
+    romaji: Option<String>,
+}
+
+fn parse_search(base: &str, html: &str) -> Result<Vec<ParsedShow>> {
     let document = Html::parse_fragment(html);
     let list = Selector::parse("#list-items .item")
         .map_err(|_| AniError::Provider("invalid result list selector".into()))?;
@@ -700,7 +778,9 @@ fn parse_search(base: &str, html: &str) -> Result<Vec<SearchResult>> {
         let Ok(url) = base.join(href) else {
             continue;
         };
-        if url.scheme() != "https" || url.host_str() != Some(expected_host) {
+        // Results must stay on the catalog origin; the scheme check mirrors
+        // the configured base so http test doubles behave like the real site.
+        if url.scheme() != base.scheme() || url.host_str() != Some(expected_host) {
             continue;
         }
         let Some(slug) = url
@@ -715,21 +795,27 @@ fn parse_search(base: &str, html: &str) -> Result<Vec<SearchResult>> {
         if !seen.insert(slug.to_owned()) {
             continue;
         }
-        let title = element
-            .select(&title_selector)
-            .next()
+        let title_element = element.select(&title_selector).next();
+        let title = title_element
             .map(|value| clean_text(&value.text().collect::<String>()))
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| slug.replace('-', " "));
-        results.push(SearchResult {
-            id: encode_id(&AnikotoCzId {
-                slug: slug.into(),
-                title: title.clone(),
-                episodes: None,
-            })?,
-            name: title,
-            episodes: 0.0,
-            provider: CatalogProvider::Anikoto2,
+        let romaji = title_element
+            .and_then(|value| value.value().attr("data-jp"))
+            .map(clean_text)
+            .filter(|value| !value.is_empty());
+        results.push(ParsedShow {
+            result: SearchResult {
+                id: encode_id(&AnikotoCzId {
+                    slug: slug.into(),
+                    title: title.clone(),
+                    episodes: None,
+                })?,
+                name: title,
+                episodes: 0.0,
+                provider: CatalogProvider::Anikoto2,
+            },
+            romaji,
         });
     }
     Ok(results)
@@ -1221,6 +1307,89 @@ mod tests {
         assert_eq!(subtitles.len(), 1);
     }
 
+    #[tokio::test]
+    async fn search_results_are_enriched_with_anilist_episode_counts() {
+        let server = MockServer::start().await;
+        let html = r#"
+            <div id="list-items" class="ani items">
+              <div class="item"><a href="/watch/frieren-beyond-journeys-end-c6fbj"><div class="name d-title" data-jp="Sousou no Frieren">Frieren: Beyond Journey's End</div></a></div>
+              <div class="item"><a href="/watch/unknown-show-zzzzzz"><div class="name d-title">Unknown Show</div></a></div>
+            </div>
+        "#;
+        Mock::given(method("GET"))
+            .and(path("/filter"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(&server)
+            .await;
+        let anilist = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "m0": {"media": [{"episodes": 28}]},
+                    "m1": {"media": []}
+                }
+            })))
+            .expect(1)
+            .mount(&anilist)
+            .await;
+
+        let client = AnikotoCzClient::builder()
+            .base_url(server.uri())
+            .anilist_api(format!("{}/graphql", anilist.uri()))
+            .build()
+            .unwrap();
+        let values = client
+            .search("frieren", TranslationType::Sub)
+            .await
+            .unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].episodes, 28.0);
+        assert_eq!(values[1].episodes, 0.0, "unmatched shows keep 0");
+        let request = anilist.received_requests().await.unwrap().remove(0);
+        let body = String::from_utf8(request.body.clone()).unwrap();
+        assert!(
+            body.contains("m0: Page")
+                && body.contains("Sousou no Frieren")
+                && body.contains("Unknown Show"),
+            "the batched query must prefer romaji titles: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_survives_anilist_enrichment_failures() {
+        let server = MockServer::start().await;
+        let html = r#"
+            <div id="list-items" class="ani items">
+              <div class="item"><a href="/watch/black-torch-1d364"><div class="name">Black Torch</div></a></div>
+            </div>
+        "#;
+        Mock::given(method("GET"))
+            .and(path("/filter"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(html))
+            .mount(&server)
+            .await;
+        let anilist = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/graphql"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&anilist)
+            .await;
+
+        let client = AnikotoCzClient::builder()
+            .base_url(server.uri())
+            .anilist_api(format!("{}/graphql", anilist.uri()))
+            .build()
+            .unwrap();
+        let values = client
+            .search("black torch", TranslationType::Sub)
+            .await
+            .unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].name, "Black Torch");
+        assert_eq!(values[0].episodes, 0.0);
+    }
+
     #[test]
     fn ids_round_trip_and_raw_slugs_are_supported() {
         let id = AnikotoCzId {
@@ -1240,14 +1409,15 @@ mod tests {
     fn parses_search_and_deduplicates_slugs() {
         let html = r#"
             <div id="list-items" class="ani items">
-              <div class="item"><a href="/watch/black-torch-1d364"><div class="name">Black Torch</div></a></div>
+              <div class="item"><a href="/watch/black-torch-1d364"><div class="name" data-jp="Black Torch">Black Torch</div></a></div>
               <div class="item"><a href="/watch/black-torch-1d364"><span class="d-title">Duplicate</span></a></div>
             </div>
         "#;
         let values = parse_search("https://anikoto.cz", html).unwrap();
         assert_eq!(values.len(), 1);
-        assert_eq!(values[0].name, "Black Torch");
-        assert_eq!(values[0].provider, CatalogProvider::Anikoto2);
+        assert_eq!(values[0].result.name, "Black Torch");
+        assert_eq!(values[0].result.provider, CatalogProvider::Anikoto2);
+        assert_eq!(values[0].romaji.as_deref(), Some("Black Torch"));
     }
 
     #[test]
@@ -1263,7 +1433,7 @@ mod tests {
         let values = parse_search("https://anikoto.cz", html).unwrap();
         assert_eq!(values.len(), 1);
         assert_eq!(
-            values[0].name,
+            values[0].result.name,
             "One Piece: Episode of Luffy - Hand Island Adventure"
         );
     }

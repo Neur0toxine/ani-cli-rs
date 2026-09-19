@@ -163,7 +163,7 @@ async fn relay_stream_inner(
             stream.headers.clone(),
             ResourceKind::Subtitle,
         )?;
-        track.url = local_url(address, &token);
+        track.url = local_url_named(address, &token, &track.label);
 
         if !expose_subtitles_in_hls {
             continue;
@@ -176,7 +176,7 @@ async fn relay_stream_inner(
             ResourceKind::SubtitlePlaylist,
         )?;
         let mut playlist_track = track.clone();
-        playlist_track.url = local_url(address, &playlist_token);
+        playlist_track.url = local_url_named(address, &playlist_token, &track.label);
         playlist_subtitles.push(playlist_track);
         if let Some(entry) = state
             .resources
@@ -250,10 +250,14 @@ async fn handle_inner(
             b"method not allowed".to_vec(),
         ));
     }
+    // The token is the first path segment; an optional trailing segment is a
+    // cosmetic display name for players that title external tracks by the URL
+    // basename (for example an mpv subtitle track label).
     let token = request
         .uri()
         .path()
         .strip_prefix("/r/")
+        .and_then(|rest| rest.split('/').next())
         .filter(|v| !v.is_empty());
     let Some(token) = token else {
         return Ok(response(
@@ -765,6 +769,33 @@ fn copy_upstream_headers(
 fn local_url(address: SocketAddr, token: &str) -> String {
     format!("http://{address}/r/{token}")
 }
+
+/// Builds a relay URL with a trailing display-name segment. The segment is
+/// ignored by the relay but becomes the URL basename, which players such as
+/// mpv use to title external subtitle tracks (e.g. "English" instead of an
+/// opaque token).
+fn local_url_named(address: SocketAddr, token: &str, label: &str) -> String {
+    let name: String = label
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '/' | '\\') {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let name = name.trim();
+    let mut url =
+        Url::parse(&local_url(address, token)).expect("loopback relay URL is always valid");
+    if !name.is_empty() && name != "." && name != ".." {
+        // `push` percent-encodes characters that are unsafe in a path segment.
+        url.path_segments_mut()
+            .expect("http URL accepts path segments")
+            .push(name);
+    }
+    url.into()
+}
 fn unix_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -997,7 +1028,24 @@ mod tests {
             .text()
             .await
             .unwrap();
-        assert!(subtitle_playlist.contains(&local.subtitles[0].url));
+        assert!(subtitle_playlist.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        // The synthetic rendition wraps the same subtitle resource that the
+        // sidecar URL exposes; both share the relay token.
+        let relay_token = |url: &str| -> String {
+            url.split("/r/")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or_default()
+                .to_owned()
+        };
+        let segment_url = subtitle_playlist
+            .lines()
+            .find(|line| line.starts_with("http://"))
+            .unwrap();
+        assert_eq!(
+            relay_token(segment_url),
+            relay_token(&local.subtitles[0].url)
+        );
         let media_url = master
             .lines()
             .find(|line| line.starts_with("http://"))
@@ -1075,7 +1123,17 @@ mod tests {
         // The direct sidecar subtitle URL is still relayed and reachable, so
         // desktop players can load it via `--sub-file`.
         assert_eq!(local.subtitles.len(), 1);
-        let subtitle = client.get(&local.subtitles[0].url).send().await.unwrap();
+        let subtitle_url = Url::parse(&local.subtitles[0].url).unwrap();
+        assert_eq!(
+            subtitle_url.path_segments().unwrap().next_back(),
+            Some("English"),
+            "sidecar URLs must end with the language label so players title the track"
+        );
+        let subtitle = client
+            .get(local.subtitles[0].url.clone())
+            .send()
+            .await
+            .unwrap();
         assert_eq!(subtitle.status(), reqwest::StatusCode::OK);
         assert_eq!(
             subtitle
