@@ -6,7 +6,7 @@ on:
       - "*"
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,3 +47,19 @@ jobs:
         with:
           name: ani-cli-rs-${{ github.ref_name }}-${{ matrix.target }}
           path: ani-cli-rs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release with binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
