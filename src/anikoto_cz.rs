@@ -113,6 +113,7 @@ impl AnikotoCzClientBuilder {
                 mapper_base: self.mapper_base.trim_end_matches('/').into(),
                 user_agent: self.user_agent,
                 series: Mutex::new(HashMap::new()),
+                source_keys: Mutex::new(None),
             }),
         })
     }
@@ -124,6 +125,7 @@ struct Inner {
     mapper_base: String,
     user_agent: String,
     series: Mutex<HashMap<String, Cached<Series>>>,
+    source_keys: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
 }
 
 #[derive(Clone)]
@@ -456,6 +458,9 @@ impl AnikotoCzClient {
         Ok(streams)
     }
 
+    /// Requests the native sources for an embed, preferring the alternate
+    /// MegaPlay CDN tiers (`s=tcdn`, `s=bcdn`) whose hosts are reachable by
+    /// non-browser clients before the Cloudflare-gated default tier.
     async fn get_native_sources(
         &self,
         origin: &str,
@@ -463,14 +468,45 @@ impl AnikotoCzClient {
         data_id: &str,
         mode: TranslationType,
     ) -> Result<Value> {
-        let mut source_url = Url::parse(&format!("{origin}/stream/getSourcesNew"))?;
-        // VidTube shares episode IDs across languages and defaults to sub.
-        source_url
-            .query_pairs_mut()
-            .append_pair("id", data_id)
-            .append_pair("type", &mode.to_string());
-        self.get_json(source_url.as_str(), embed_url, true, Some(origin))
-            .await
+        let mut failure = None;
+        for tier in ["tcdn", "bcdn", ""] {
+            let mut source_url = Url::parse(&format!("{origin}/stream/getSourcesNew"))?;
+            {
+                let mut pairs = source_url.query_pairs_mut();
+                // VidTube shares episode IDs across languages and defaults to sub.
+                pairs.append_pair("id", data_id);
+                pairs.append_pair("type", &mode.to_string());
+                if !tier.is_empty() {
+                    pairs.append_pair("s", tier);
+                }
+            }
+            match self
+                .get_json(source_url.as_str(), embed_url, true, Some(origin))
+                .await
+            {
+                Ok(payload) => {
+                    let payload = crate::megaplay::recover_encrypted_sources(
+                        &self.inner.http,
+                        origin,
+                        &self.inner.source_keys,
+                        payload,
+                    )
+                    .await;
+                    let (sources, _) = parse_sources(&payload);
+                    if !sources.is_empty() {
+                        return Ok(payload);
+                    }
+                    failure = Some(AniError::Provider(
+                        "embed returned no supported native streams".into(),
+                    ));
+                }
+                Err(error @ AniError::ProviderRateLimited { .. }) => return Err(error),
+                Err(error) => failure = Some(error),
+            }
+        }
+        Err(failure.unwrap_or_else(|| {
+            AniError::Provider("embed returned no supported native streams".into())
+        }))
     }
 
     async fn expand_hls(
@@ -1107,24 +1143,12 @@ fn cache_put<T>(cache: &Mutex<HashMap<String, Cached<T>>>, key: String, value: T
     }
 }
 
+/// MegaPlay/VidTube media hosts rotate per resolution and serve HLS segments
+/// as PNG-wrapped MPEG-TS that desktop players cannot decode directly. Any
+/// HLS stream carrying embed browser context must therefore be unwrapped by
+/// the loopback relay instead of matching a static hostname allowlist.
 pub fn requires_hls_relay(stream: &StreamLink) -> bool {
-    stream.hls
-        && Url::parse(&stream.url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .is_some_and(|host| {
-                [
-                    "megaplay.buzz",
-                    "megap.shiora.top",
-                    "shiora.top",
-                    "megap.kotocdn.site",
-                    "kotocdn.site",
-                    "megap.akirax.buzz",
-                    "akirax.buzz",
-                ]
-                .iter()
-                .any(|domain| host_matches(&host, domain))
-            })
+    stream.hls && stream.headers.carries_browser_context()
 }
 
 #[cfg(test)]
@@ -1164,6 +1188,37 @@ mod tests {
             let (sources, _) = parse_sources(&payload);
             assert_eq!(sources[0].0, media_url);
         }
+    }
+
+    #[tokio::test]
+    async fn encrypted_native_sources_are_recovered() {
+        let server = MockServer::start().await;
+        let client = AnikotoCzClient::new().unwrap();
+        let plain = serde_json::json!({"file": "https://media.example/sub.m3u8"});
+        let enc = crate::megaplay::encrypt_payload_with_default_keys(plain.to_string().as_bytes())
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/stream/getSourcesNew"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "enc": enc,
+                "tracks": [{"file": "https://media.example/en.vtt", "kind": "captions"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let payload = client
+            .get_native_sources(
+                &server.uri(),
+                "https://vidtube.site/stream/example/sub",
+                "42",
+                TranslationType::Sub,
+            )
+            .await
+            .unwrap();
+        let (sources, subtitles) = parse_sources(&payload);
+        assert_eq!(sources[0].0, "https://media.example/sub.m3u8");
+        assert_eq!(subtitles.len(), 1);
     }
 
     #[test]

@@ -111,6 +111,7 @@ impl AnikotoClientBuilder {
                 user_agent: self.user_agent,
                 searches: Mutex::new(HashMap::new()),
                 series: Mutex::new(HashMap::new()),
+                source_keys: Mutex::new(None),
             }),
         })
     }
@@ -124,6 +125,7 @@ struct Inner {
     user_agent: String,
     searches: Mutex<HashMap<String, Cached<Vec<SearchResult>>>>,
     series: Mutex<HashMap<String, Cached<Vec<AnikotoEpisode>>>>,
+    source_keys: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
 }
 
 #[derive(Clone)]
@@ -295,33 +297,14 @@ impl AnikotoClient {
         let data_id = parse_data_id(&html).ok_or_else(|| {
             AniError::Provider("MegaPlay did not expose a playable source id".into())
         })?;
-        let source_url = format!(
-            "{}/stream/getSources?id={data_id}",
-            self.inner.megaplay_base
-        );
-        let payload = self
-            .get_json(
-                &source_url,
-                Some(embed_url),
-                Some(&self.inner.megaplay_base),
-            )
-            .await?;
-        let (sources, subtitles) = parse_megaplay_sources(&payload);
-        if sources.is_empty() {
-            return Err(AniError::Provider(
-                "MegaPlay did not return any supported native streams".into(),
-            ));
-        }
+        let (sources, subtitles) = self.megaplay_sources(embed_url, &data_id).await?;
 
         let mut streams = Vec::new();
         for (url, resolution) in sources {
             let parsed = validate_remote_url(&url)?;
             let hls = parsed.path().to_ascii_lowercase().contains(".m3u8")
                 || parsed.query().is_some_and(|query| query.contains(".m3u8"));
-            let headers = media_headers(
-                parsed.host_str().unwrap_or_default(),
-                &self.inner.user_agent,
-            );
+            let headers = media_headers(&self.inner.megaplay_base, &self.inner.user_agent);
             let mut expanded = if hls {
                 self.expand_hls(&url, &resolution, &headers).await?
             } else {
@@ -335,6 +318,58 @@ impl AnikotoClient {
         let mut seen = HashSet::new();
         streams.retain(|stream| seen.insert(stream.url.clone()));
         Ok(streams)
+    }
+
+    /// Requests the MegaPlay sources for a data id, preferring the alternate
+    /// CDN tiers (`s=tcdn`, `s=bcdn`) whose hosts are reachable by
+    /// non-browser clients before the Cloudflare-gated default tier.
+    async fn megaplay_sources(
+        &self,
+        embed_url: &str,
+        data_id: &str,
+    ) -> Result<(Vec<(String, String)>, Vec<SubtitleTrack>)> {
+        let mut failure = None;
+        for tier in ["tcdn", "bcdn", ""] {
+            let mut source_url =
+                Url::parse(&format!("{}/stream/getSources", self.inner.megaplay_base))?;
+            {
+                let mut pairs = source_url.query_pairs_mut();
+                pairs.append_pair("id", data_id);
+                if !tier.is_empty() {
+                    pairs.append_pair("s", tier);
+                }
+            }
+            match self
+                .get_json(
+                    source_url.as_str(),
+                    Some(embed_url),
+                    Some(&self.inner.megaplay_base),
+                )
+                .await
+            {
+                Ok(payload) => {
+                    let payload = crate::megaplay::recover_encrypted_sources(
+                        &self.inner.http,
+                        &self.inner.megaplay_base,
+                        &self.inner.source_keys,
+                        payload,
+                    )
+                    .await;
+                    let (sources, subtitles) = parse_megaplay_sources(&payload);
+                    if !sources.is_empty() {
+                        return Ok((sources, subtitles));
+                    }
+                    failure = Some(AniError::Provider(
+                        "MegaPlay did not return any supported native streams".into(),
+                    ));
+                }
+                Err(error @ AniError::ProviderRateLimited { .. }) => return Err(error),
+                Err(error) => failure = Some(error),
+            }
+        }
+        Err(failure.unwrap_or_else(|| {
+            AniError::Provider("MegaPlay did not return any supported native streams".into())
+        }))
     }
 
     async fn expand_hls(
@@ -704,42 +739,24 @@ fn parse_megaplay_sources(value: &Value) -> (Vec<(String, String)>, Vec<Subtitle
     (sources, tracks)
 }
 
-fn media_headers(host: &str, user_agent: &str) -> RequestHeaders {
-    if is_megaplay_media_host(host) {
-        RequestHeaders {
-            referer: Some("https://megaplay.buzz/".into()),
-            origin: Some("https://megaplay.buzz".into()),
-            extra: [("User-Agent".into(), user_agent.into())].into(),
-        }
-    } else {
-        RequestHeaders::default()
+/// Every stream resolved through a MegaPlay embed needs the embed origin as
+/// browser context: delivery manifests are often rejected without it.
+fn media_headers(base: &str, user_agent: &str) -> RequestHeaders {
+    let base = base.trim_end_matches('/');
+    RequestHeaders {
+        referer: Some(format!("{base}/")),
+        origin: Some(base.to_owned()),
+        extra: [("User-Agent".into(), user_agent.into())].into(),
     }
 }
 
-pub(crate) fn is_megaplay_media_host(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    [
-        "megaplay.buzz",
-        "mewstream.buzz",
-        "lostproject.club",
-        "voltara.click",
-        "kotocdn.site",
-        "megap.shiora.top",
-        "shiora.top",
-        "megap.kotocdn.site",
-        "megap.akirax.buzz",
-        "akirax.buzz",
-    ]
-    .iter()
-    .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
-}
-
+/// MegaPlay media hosts rotate per resolution (for example `megap.norami.top`,
+/// `megap.mikora.top`, `fetch.nexabloom.top`) and serve HLS segments as
+/// PNG-wrapped MPEG-TS that desktop players cannot decode directly. Any HLS
+/// stream carrying MegaPlay browser context must therefore be unwrapped by
+/// the loopback relay instead of matching a static hostname allowlist.
 pub fn requires_hls_relay(stream: &StreamLink) -> bool {
-    stream.hls
-        && Url::parse(&stream.url)
-            .ok()
-            .and_then(|url| url.host_str().map(str::to_owned))
-            .is_some_and(|host| is_megaplay_media_host(&host))
+    stream.hls && stream.headers.carries_browser_context()
 }
 
 fn stream_link(url: String, resolution: String, hls: bool, headers: RequestHeaders) -> StreamLink {
@@ -952,10 +969,33 @@ mod tests {
     }
 
     #[test]
-    fn host_allowlist_rejects_lookalikes() {
-        assert!(is_megaplay_media_host("megap.kotocdn.site"));
-        assert!(!is_megaplay_media_host("kotocdn.site.example.com"));
-        assert!(!is_megaplay_media_host("evilmegaplay.buzz"));
+    fn relay_follows_browser_context_instead_of_host_allowlists() {
+        let megaplay_headers = RequestHeaders {
+            referer: Some("https://megaplay.buzz/".into()),
+            origin: Some("https://megaplay.buzz".into()),
+            ..RequestHeaders::default()
+        };
+        // Rotating alternate-tier hosts are recognized through their headers.
+        let mut stream = stream_link(
+            "https://megap.norami.top/media/index-f1-v1-a1.m3u8".into(),
+            "1080p".into(),
+            true,
+            megaplay_headers.clone(),
+        );
+        assert!(requires_hls_relay(&stream));
+        stream.url = "https://fetch.nexabloom.top/anime/master.m3u8".into();
+        assert!(requires_hls_relay(&stream));
+        // Lookalike hosts are treated like any other MegaPlay delivery host
+        // as long as the provider attached browser context.
+        stream.url = "https://evilmegaplay.buzz/master.m3u8".into();
+        assert!(requires_hls_relay(&stream));
+        // Without provider context, direct playback must stay enabled.
+        stream.headers = RequestHeaders::default();
+        assert!(!requires_hls_relay(&stream));
+        // Non-HLS sources are never relayed.
+        stream.hls = false;
+        stream.headers = megaplay_headers;
+        assert!(!requires_hls_relay(&stream));
     }
 
     #[test]
@@ -1031,6 +1071,40 @@ mod tests {
         let id = encode_id(&AnikotoId {
             anilist_id: Some("1".into()),
             mal_id: Some("2".into()),
+            episodes: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+        let streams = client
+            .streams(&id, "1", TranslationType::Sub)
+            .await
+            .unwrap();
+        assert_eq!(streams[0].url, "https://voltara.click/video.mp4");
+    }
+
+    #[tokio::test]
+    async fn megaplay_encrypted_sources_are_decrypted() {
+        let server = MockServer::start().await;
+        let plain = json!({"file": "https://voltara.click/video.mp4"});
+        let enc = crate::megaplay::encrypt_payload_with_default_keys(plain.to_string().as_bytes())
+            .unwrap();
+        Mock::given(method("GET"))
+            .and(path("/stream/ani/1/1/sub"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<div data-id=\"99\"></div>"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/stream/getSources"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"enc": enc})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = AnikotoClient::builder()
+            .megaplay_base(server.uri())
+            .build()
+            .unwrap();
+        let id = encode_id(&AnikotoId {
+            anilist_id: Some("1".into()),
             episodes: Some(1),
             ..Default::default()
         })

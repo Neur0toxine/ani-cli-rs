@@ -150,6 +150,14 @@ pub struct RequestHeaders {
     pub extra: BTreeMap<String, String>,
 }
 
+impl RequestHeaders {
+    /// True when the provider attached browser context (referer or origin)
+    /// that upstream media requests are required to carry.
+    pub fn carries_browser_context(&self) -> bool {
+        self.referer.is_some() || self.origin.is_some()
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StreamLink {
     pub url: String,

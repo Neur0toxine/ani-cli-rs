@@ -64,9 +64,9 @@ Each episode can use different third-party hosts. Some copies are deleted, block
 
 ## When should I use `--ignore-host-lists`?
 
-Use the `--ignore-host-lists` (or `-I`) flag when you encounter playback issues that might be caused by new or unrecognized streaming domains. This forces all HLS streams through the local relay regardless of the host domain, which can resolve issues with:
+Provider HLS streams that carry MegaPlay browser context are already routed through the local relay automatically, including streams from rotating delivery domains. Use the `--ignore-host-lists` (or `-I`) flag to force *all* HLS streams through the relay, which can help with:
 
-- New provider domains not yet in the HLS relay allowlist
+- HLS streams from sources other than MegaPlay embeds
 - Temporary domain changes by streaming providers
 - Provider switching to backup domains
 

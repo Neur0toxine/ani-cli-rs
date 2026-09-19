@@ -693,6 +693,12 @@ mod tests {
                 "--http-header-fields=Origin: https://origin.example",
                 "--sub-file=https://media/subtitles.vtt",
                 "--slang=English",
+                // The stream carries provider browser context, so it is
+                // relayed and receives the HLS relay cache settings.
+                "--cache=yes",
+                "--cache-secs=120",
+                "--demuxer-max-bytes=512MiB",
+                "--demuxer-max-back-bytes=256MiB",
             ]
         );
     }

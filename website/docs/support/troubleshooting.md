@@ -132,7 +132,7 @@ Resolve the source again. Test the other catalog, another network, or a VPN only
 If the player doesn't start or shows errors loading the stream, it may be due to:
 
 1. **Player executable not found**: Verify the player is installed and in PATH (see above)
-2. **New streaming domains**: Some providers may use new domains not yet in the HLS relay allowlist
+2. **Stream requires browser context**: HLS streams carrying MegaPlay referrer/origin headers are routed through the local relay automatically; streams from other sources can be forced through it
 
 Try forcing all streams through the HLS relay using the `--ignore-host-lists` flag:
 

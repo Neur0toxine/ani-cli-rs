@@ -790,8 +790,8 @@ async fn run_command(
                 )
                 .await?;
             if let Some(quality) = args.quality {
-                let value = choose_quality(&values, &quality)
-                    .ok_or(AniError::UnavailableNoStreams)?;
+                let value =
+                    choose_quality(&values, &quality).ok_or(AniError::UnavailableNoStreams)?;
                 output(std::slice::from_ref(value), args.json, |value| {
                     format!("{}\t{}\t{}", value.resolution, value.provider, value.url)
                 })?;
@@ -806,8 +806,8 @@ async fn run_command(
             let streams = clients
                 .streams(&args.show_id, provider, &args.episode, mode)
                 .await?;
-            let stream = choose_quality(&streams, &args.quality)
-                .ok_or(AniError::UnavailableNoStreams)?;
+            let stream =
+                choose_quality(&streams, &args.quality).ok_or(AniError::UnavailableNoStreams)?;
             let mut options = PlayerOptions::default_player();
             if let Some(executable) = args.player {
                 options.executable = executable;
@@ -828,8 +828,8 @@ async fn run_command(
                     TranslationType::from_str(&args.mode)?,
                 )
                 .await?;
-            let stream = choose_quality(&streams, &args.quality)
-                .ok_or(AniError::UnavailableNoStreams)?;
+            let stream =
+                choose_quality(&streams, &args.quality).ok_or(AniError::UnavailableNoStreams)?;
             let options = DownloadOptions {
                 directory: args.output.unwrap_or_else(|| PathBuf::from(".")),
                 filename: format!("{} Episode {}", args.title, args.episode),
@@ -1139,8 +1139,8 @@ async fn preflight_downloads(
             let streams = clients
                 .streams(&show.id, show.provider, episode, mode)
                 .await?;
-            let stream = choose_download_stream(&streams, quality)
-                .ok_or(AniError::UnavailableNoStreams)?;
+            let stream =
+                choose_download_stream(&streams, quality).ok_or(AniError::UnavailableNoStreams)?;
             Ok(PreparedEpisode {
                 episode: episode.clone(),
                 stream,

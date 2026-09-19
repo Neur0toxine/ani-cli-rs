@@ -8,6 +8,7 @@ mod error;
 mod history;
 mod hls_relay;
 mod i18n;
+mod megaplay;
 mod models;
 mod player;
 

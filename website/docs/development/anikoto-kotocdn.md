@@ -455,7 +455,7 @@ Respect upstream rate limits. Do not put these commands in a tight loop.
 | `data-id` is missing | Player markup changed or an error/challenge page was returned | Log status, content type, final URL, and a short sanitized HTML signature |
 | `getSources` returns 403 | Missing/incorrect `Referer`, `Origin`, or browser User-Agent | Compare the request with the header set above |
 | HLS manifest returns 403 | Delivery host was not classified or provider headers were lost | Check the final hostname and Electron request interception |
-| Manifest loads but segments fail | Segments use another unregistered domain | Inspect the master/media playlist hostnames and extend the narrow allowlist |
+| Manifest loads but segments fail | Segments are served from rotating or disguised hosts outside the relay flow | Confirm the resolved stream still carries the MegaPlay referer/origin headers so it is routed through the HLS relay |
 | FFmpeg reports `dimensions not set` for a MegaPlay download | A segment was detected as its PNG wrapper instead of the appended MPEG-TS payload | Inspect the first bytes without logging the signed URL; retain the scoped HLS relay and MPEG-TS sync validation |
 | Video plays but subtitles do not | Subtitle host lacks headers/CORS handling or track shape changed | Inspect `tracks`, `captions`, and `subtitles` fields |
 | Watch Together remains “loading” | Only the iframe resolved for that participant | Confirm that at least one returned link has `embed !== true` |

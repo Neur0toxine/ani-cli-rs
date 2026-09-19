@@ -8,7 +8,7 @@ pub type Result<T> = std::result::Result<T, AniError>;
 pub enum AniError {
     #[error("network request failed")]
     Network(String),
-    #[error("malformed provider data")]
+    #[error("malformed provider data: {0}")]
     Provider(String),
     #[error("catalog error")]
     Catalog { provider: String, message: String },
