@@ -1,3 +1,7 @@
+> [!WARNING]
+> This is a personal-use fork, created because upstream did not adapt to newer provider changes quickly enough.
+> The changes here are 100% AI slop — a quick fix, nothing more. If you found this fork, do not use it long-term; use the [upstream project](https://github.com/vorlie/ani-cli-rs) instead.
+> All credits and rights belong to the original authors.
 
 <div align="center">
 
