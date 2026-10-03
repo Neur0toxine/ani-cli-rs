@@ -11,6 +11,7 @@ mod i18n;
 mod megaplay;
 mod models;
 mod player;
+mod subtitles;
 
 #[cfg(feature = "gui")]
 pub mod gui;

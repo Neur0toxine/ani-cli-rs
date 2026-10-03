@@ -12,6 +12,12 @@ ani-cli-rs "title"
 
 ani-cli-rs passes the stream URL, media title, and provider referrer as separate process arguments. mpv receives `--tls-verify=no` for compatibility with third-party media hosts.
 
+For desktop mpv, IINA, Syncplay, and VLC, ani-cli-rs fetches external provider subtitles and converts WebVTT/SRT to ASS before playback. Converted tracks are served from memory over a loopback URL; no temporary subtitle files or external conversion tools are needed. Playback stays attached while this subtitle server is in use.
+
+The converter repairs blank paragraphs inside signs (which can otherwise stop FFmpeg from reading later dialogue), keeps overlapping cues, and supports bold, italic, underline, HTML entities, WebVTT color classes, simple `::cue` tag/class styles, CSS colors, fonts, and horizontal cue positioning/alignment/size. Background colors are approximated with colored outlines. Vertical writing, regions, complex CSS selectors, and exact browser layout are not supported. Existing ASS/SSA scripts retain their original styles. Formatting already absent from the provider file cannot be recovered.
+
+Downloads use the same conversion and keep styled ASS sidecars beside the MP4, because embedded MP4 subtitles cannot retain full ASS typesetting. Subtitle files must be UTF-8 (an optional BOM is accepted). Failed tracks are reported and omitted without stopping video playback.
+
 Override the executable:
 
 ```powershell

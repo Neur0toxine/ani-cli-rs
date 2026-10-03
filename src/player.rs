@@ -260,8 +260,20 @@ impl Player {
             }
         }
 
+        // Keep the in-memory ASS server alive until the player exits. This also
+        // covers direct MP4/HLS URLs and streams already relayed by the GUI.
+        let prepared = if !stream.subtitles.is_empty()
+            && matches!(
+                self.options.kind,
+                PlayerKind::Mpv | PlayerKind::Iina | PlayerKind::Syncplay | PlayerKind::Vlc
+            ) {
+            Some(crate::hls_relay::prepare_desktop_subtitles(stream).await?)
+        } else {
+            None
+        };
+        let stream = prepared.as_ref().map_or(stream, |(_, local)| local);
         let mut command = Command::new(&self.options.executable);
-        let attached = self.options.no_detach || force_attached;
+        let attached = self.options.no_detach || force_attached || prepared.is_some();
         let args = self.command_args_inner(stream, title, attached);
         info!(
             title = %title,

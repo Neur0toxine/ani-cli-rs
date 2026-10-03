@@ -9,6 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures_util::{StreamExt, stream};
 use http_body_util::Full;
 use hyper::{
     Method, Request, Response, StatusCode, body::Incoming, header, server::conn::http1,
@@ -18,7 +19,7 @@ use hyper_util::rt::TokioIo;
 use reqwest::Client;
 use sha2::{Digest, Sha256};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{AniError, RequestHeaders, Result, StreamLink, SubtitleTrack};
@@ -46,6 +47,8 @@ struct Registered {
     kind: ResourceKind,
     subtitles: Vec<SubtitleTrack>,
     duration_seconds: Option<f64>,
+    /// Prepared desktop subtitles are immutable and never fetched again.
+    prepared: Option<Bytes>,
 }
 
 struct State {
@@ -101,6 +104,80 @@ pub async fn relay_stream_without_hls_subtitles(
     relay_stream_inner(stream, false).await
 }
 
+/// Fetch, repair and convert desktop subtitle tracks before launching a player.
+/// The video URL and its headers stay unchanged. The returned guard must live
+/// until playback ends, even when the video itself does not require a relay.
+pub(crate) async fn prepare_desktop_subtitles(
+    source: &StreamLink,
+) -> Result<(HlsRelay, StreamLink)> {
+    const MAX_TRACKS: usize = 32;
+    const MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+    let (relay, state) = start_relay().await?;
+    let mut local = source.clone();
+    local.subtitles.clear();
+    if source.subtitles.len() > MAX_TRACKS {
+        warn!("only the first 32 provider subtitle tracks will be prepared");
+    }
+    let jobs = source
+        .subtitles
+        .iter()
+        .take(MAX_TRACKS)
+        .cloned()
+        .enumerate()
+        .map(|(index, track)| {
+            let state = Arc::clone(&state);
+            let headers = source.headers.clone();
+            async move {
+                let result = async {
+                    let url = validate_upstream(&track.url)?;
+                    let bytes =
+                        crate::subtitles::fetch(&state.client, url.as_str(), &headers).await?;
+                    let ass = crate::subtitles::to_ass(&bytes)?;
+                    Ok::<_, AniError>((url, Bytes::from(ass)))
+                }
+                .await;
+                (index, track, result)
+            }
+        });
+    let mut results = stream::iter(jobs).buffer_unordered(4);
+    let mut tracks = Vec::new();
+    let mut total = 0;
+    while let Some((index, mut track, result)) = results.next().await {
+        let (url, body) = match result {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(label = %track.label, error = %error, "could not prepare provider subtitles");
+                eprintln!("Could not prepare subtitle '{}': {error}", track.label);
+                continue;
+            }
+        };
+        total += body.len();
+        if total > MAX_TOTAL_BYTES {
+            return Err(AniError::Provider(
+                "prepared subtitles exceed the 64 MiB limit".into(),
+            ));
+        }
+        let token = register(
+            &state,
+            url,
+            RequestHeaders::default(),
+            ResourceKind::Subtitle,
+        )?;
+        state
+            .resources
+            .lock()
+            .expect("relay registry poisoned")
+            .get_mut(&token)
+            .expect("registered subtitle")
+            .prepared = Some(body);
+        track.url = local_url_named(state.base, &token, &format!("{}.ass", track.label));
+        tracks.push((index, track));
+    }
+    tracks.sort_by_key(|(index, _)| *index);
+    local.subtitles = tracks.into_iter().map(|(_, track)| track).collect();
+    Ok((relay, local))
+}
+
 async fn relay_stream_inner(
     stream: &StreamLink,
     expose_subtitles_in_hls: bool,
@@ -109,48 +186,16 @@ async fn relay_stream_inner(
         return Err(AniError::Input("only HLS streams can be relayed".into()));
     }
     let upstream = validate_upstream(&stream.url)?;
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let address = listener.local_addr()?;
-    info!(
-        bind_address = %address,
-        upstream_host = %upstream.host_str().unwrap_or("?"),
-        expose_subtitles_in_hls,
-        subtitle_tracks = stream.subtitles.len(),
-        "starting loopback HLS relay",
-    );
-    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-    let state = Arc::new(State {
-        client: Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(8))
-            .build()?,
-        base: address,
-        resources: Mutex::new(HashMap::new()),
-        tokens_by_url: Mutex::new(HashMap::new()),
-        counter: AtomicU64::new(0),
-        secret: format!("{}-{}", std::process::id(), unix_nanos()),
-    });
+    let (relay, state) = start_relay().await?;
+    let address = state.base;
+    info!(bind_address = %address, expose_subtitles_in_hls,
+        subtitle_tracks = stream.subtitles.len(), "starting loopback HLS relay");
     let token = register(
         &state,
         upstream,
         stream.headers.clone(),
         ResourceKind::EntryPlaylist,
     )?;
-    let server_state = Arc::clone(&state);
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break,
-                accepted = listener.accept() => {
-                    let Ok((socket, _)) = accepted else { break };
-                    let state = Arc::clone(&server_state);
-                    tokio::spawn(async move {
-                        let service = service_fn(move |request| handle(Arc::clone(&state), request));
-                        let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), service).await;
-                    });
-                }
-            }
-        }
-    });
     let mut local = stream.clone();
     local.url = local_url(address, &token);
     local.headers = RequestHeaders::default();
@@ -201,12 +246,45 @@ async fn relay_stream_inner(
         bind_address = %address,
         "HLS relay is ready to serve the rewritten stream URL",
     );
+    Ok((relay, local))
+}
+
+async fn start_relay() -> Result<(HlsRelay, Arc<State>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let state = Arc::new(State {
+        client: Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(8))
+            .build()?,
+        base: address,
+        resources: Mutex::new(HashMap::new()),
+        tokens_by_url: Mutex::new(HashMap::new()),
+        counter: AtomicU64::new(0),
+        secret: format!("{}-{}", std::process::id(), unix_nanos()),
+    });
+    let server_state = Arc::clone(&state);
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((socket, _)) = accepted else { break };
+                    let state = Arc::clone(&server_state);
+                    tokio::spawn(async move {
+                        let service = service_fn(move |request| handle(Arc::clone(&state), request));
+                        let _ = http1::Builder::new().serve_connection(TokioIo::new(socket), service).await;
+                    });
+                }
+            }
+        }
+    });
     Ok((
         HlsRelay {
             shutdown: Some(shutdown_tx),
             task,
         },
-        local,
+        state,
     ))
 }
 
@@ -279,6 +357,23 @@ async fn handle_inner(
             b"invalid relay token".to_vec(),
         ));
     };
+    if let Some(body) = registered.prepared {
+        let length = body.len();
+        let mut result = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/x-ssa; charset=utf-8")
+            .header(header::CONTENT_LENGTH, length)
+            .body(Full::new(if request.method() == Method::HEAD {
+                Bytes::new()
+            } else {
+                body
+            }))
+            .expect("valid subtitle response");
+        result
+            .headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".parse().unwrap());
+        return Ok(result);
+    }
     if registered.kind == ResourceKind::SubtitlePlaylist {
         let segment_token = register(
             state,
@@ -643,6 +738,7 @@ fn register(
             kind,
             subtitles: Vec::new(),
             duration_seconds: None,
+            prepared: None,
         },
     );
     state
@@ -808,8 +904,71 @@ mod tests {
     use super::*;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{method, path},
+        matchers::{header as match_header, method, path},
     };
+
+    #[tokio::test]
+    async fn prepares_direct_stream_subtitles_in_memory_with_headers_and_caching() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/english.vtt"))
+            .and(match_header("Referer", "https://provider.example/"))
+            .and(match_header("Origin", "https://provider.example"))
+            .and(match_header("User-Agent", "subtitle-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "WEBVTT\n\n16:29.720 --> 16:34.930\n<b>Banish evil\n\nBegone</b>\n\n16:35.580 --> 16:36.660\nLater dialogue\n",
+            ))
+            .expect(1)
+            .mount(&server).await;
+        let source = StreamLink {
+            url: "https://media.example/episode.mp4".into(),
+            resolution: "1080p".into(),
+            hls: false,
+            provider: "test".into(),
+            downloadable: true,
+            headers: RequestHeaders {
+                referer: Some("https://provider.example/".into()),
+                origin: Some("https://provider.example".into()),
+                extra: [("User-Agent".into(), "subtitle-test".into())].into(),
+            },
+            subtitles: vec![SubtitleTrack {
+                label: "English (CR)".into(),
+                url: format!("{}/english.vtt", server.uri()),
+                default: true,
+            }],
+        };
+        let (relay, local) = prepare_desktop_subtitles(&source).await.unwrap();
+        assert_eq!(local.url, source.url);
+        assert_eq!(local.headers.referer, source.headers.referer);
+        assert_eq!(local.subtitles.len(), 1);
+        assert!(local.subtitles[0].default);
+        assert!(local.subtitles[0].url.ends_with("English%20(CR).ass"));
+        let client = Client::new();
+        let response = client.get(&local.subtitles[0].url).send().await.unwrap();
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/x-ssa; charset=utf-8"
+        );
+        let length = response.content_length().unwrap();
+        let body = response.text().await.unwrap();
+        assert!(body.contains("Banish evil\\NBegone"));
+        assert!(body.contains("Later dialogue"));
+        let head = client.head(&local.subtitles[0].url).send().await.unwrap();
+        assert_eq!(head.headers()[header::CONTENT_LENGTH], length.to_string());
+        assert!(head.bytes().await.unwrap().is_empty());
+        // Upstream is fetched once; range/conditional requests still receive
+        // a complete immutable ASS track instead of stale upstream metadata.
+        let cached = client
+            .get(&local.subtitles[0].url)
+            .header(header::RANGE, "bytes=0-20")
+            .header(header::IF_NONE_MATCH, "upstream-etag")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::OK);
+        assert_eq!(cached.text().await.unwrap(), body);
+        drop(relay);
+    }
 
     #[test]
     fn strips_only_confirmed_png_wrapped_transport_streams() {

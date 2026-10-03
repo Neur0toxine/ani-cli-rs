@@ -13,8 +13,6 @@ use crate::{
     relay_stream_without_hls_subtitles, requires_hls_relay,
 };
 
-const MAX_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
-
 #[derive(Clone, Debug)]
 pub struct DownloadOptions {
     pub directory: PathBuf,
@@ -79,10 +77,11 @@ async fn attach_subtitles(stream: &StreamLink, target: &Path) -> Result<()> {
                 tokio::fs::remove_file(target).await?;
             }
             tokio::fs::rename(&muxed, target).await?;
-            for subtitle in subtitles {
-                let _ = tokio::fs::remove_file(subtitle.path).await;
-            }
-            eprintln!("Embedded provider subtitles into the downloaded MP4.");
+            // MP4 mov_text cannot retain ASS typesetting. Keep the converted
+            // sidecars so players can also load the full styled subtitles.
+            eprintln!(
+                "Embedded provider subtitles into the downloaded MP4; styled ASS sidecars were kept."
+            );
         }
         Ok(status) => {
             let _ = tokio::fs::remove_file(&muxed).await;
@@ -108,65 +107,20 @@ async fn download_subtitle_track(
     index: usize,
 ) -> Result<DownloadedSubtitle> {
     let client = reqwest::Client::builder().build()?;
-    let mut request = client.get(&track.url);
-    if let Some(referer) = &headers.referer {
-        request = request.header(header::REFERER, referer);
-    }
-    if let Some(origin) = &headers.origin {
-        request = request.header(header::ORIGIN, origin);
-    }
-    for (name, value) in &headers.extra {
-        request = request.header(name, value);
-    }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        return Err(AniError::Download(format!(
-            "subtitle server returned {}",
-            response.status()
-        )));
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_SUBTITLE_BYTES as u64)
-    {
-        return Err(AniError::Download(
-            "subtitle track exceeds the 16 MiB limit".into(),
-        ));
-    }
-    let bytes = response.bytes().await?;
-    if bytes.len() > MAX_SUBTITLE_BYTES {
-        return Err(AniError::Download(
-            "subtitle track exceeds the 16 MiB limit".into(),
-        ));
-    }
+    let bytes = crate::subtitles::fetch(&client, &track.url, headers).await?;
+    let ass = crate::subtitles::to_ass(&bytes)?;
     let stem = target
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("episode");
     let label = sanitize_filename(&track.label);
-    let extension = subtitle_extension(&track.url);
-    let path = target.with_file_name(format!("{stem}.{index}.{label}.{extension}"));
-    tokio::fs::write(&path, bytes).await?;
+    let path = target.with_file_name(format!("{stem}.{index}.{label}.ass"));
+    tokio::fs::write(&path, ass).await?;
     Ok(DownloadedSubtitle {
         path,
         label: track.label.clone(),
         default: track.default,
     })
-}
-
-fn subtitle_extension(url: &str) -> &'static str {
-    let extension = url::Url::parse(url).ok().and_then(|url| {
-        Path::new(url.path())
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(str::to_ascii_lowercase)
-    });
-    match extension.as_deref() {
-        Some("srt") => "srt",
-        Some("ass") => "ass",
-        Some("ssa") => "ssa",
-        _ => "vtt",
-    }
 }
 
 fn subtitle_mux_args(
@@ -698,6 +652,42 @@ mod tests {
     use super::*;
     use crate::RequestHeaders;
 
+    #[tokio::test]
+    async fn downloads_repaired_styled_ass_sidecars() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+        let server = MockServer::start().await;
+        Mock::given(method("GET")).and(path("/subs.vtt"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "WEBVTT\n\n00:01.000 --> 00:02.000\n<b>Sign\n\nContinued</b>\n\n00:03.000 --> 00:04.000\n<c.red>Later</c>\n",
+            )).mount(&server).await;
+        let directory = tempfile::tempdir().unwrap();
+        let track = SubtitleTrack {
+            label: "English".into(),
+            url: format!("{}/subs.vtt", server.uri()),
+            default: true,
+        };
+        let downloaded = download_subtitle_track(
+            &track,
+            &RequestHeaders::default(),
+            &directory.path().join("episode.mp4"),
+            0,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            downloaded.path.file_name().unwrap(),
+            "episode.0.English.ass"
+        );
+        assert!(downloaded.default);
+        let ass = tokio::fs::read_to_string(downloaded.path).await.unwrap();
+        assert!(ass.contains("Sign\\NContinued"));
+        assert!(ass.contains("Later"));
+        assert!(ass.contains("\\1c&H0000FF&"));
+    }
+
     fn test_stream(hls: bool) -> StreamLink {
         StreamLink {
             url: "https://media.example/video".into(),
@@ -824,19 +814,6 @@ mod tests {
         assert!(args.contains(&"mov_text".into()));
         assert!(args.contains(&"language=eng".into()));
         assert!(args.contains(&"language=pol".into()));
-    }
-
-    #[test]
-    fn subtitle_extensions_are_restricted_to_supported_text_formats() {
-        assert_eq!(
-            subtitle_extension("https://cdn.example/subtitle.srt?token=1"),
-            "srt"
-        );
-        assert_eq!(
-            subtitle_extension("https://cdn.example/subtitle.ass"),
-            "ass"
-        );
-        assert_eq!(subtitle_extension("http://127.0.0.1:1/r/token"), "vtt");
     }
 
     #[test]
