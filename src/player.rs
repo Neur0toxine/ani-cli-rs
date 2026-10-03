@@ -195,6 +195,18 @@ impl Player {
             subtitles = stream.subtitles.len(),
             "playback requested",
         );
+        // Convert upstream HTTPS subtitles before rewriting URLs to loopback
+        // HTTP. Keep the ASS server alive until the player exits.
+        let prepared = if !stream.subtitles.is_empty()
+            && matches!(
+                self.options.kind,
+                PlayerKind::Mpv | PlayerKind::Iina | PlayerKind::Syncplay | PlayerKind::Vlc
+            ) {
+            Some(crate::hls_relay::prepare_desktop_subtitles(stream).await?)
+        } else {
+            None
+        };
+        let stream = prepared.as_ref().map_or(stream, |(_, local)| local);
         if self.options.force_hls_relay
             || crate::requires_hls_relay(stream)
             || (self.is_android_player() && stream.hls)
@@ -212,11 +224,19 @@ impl Player {
             // subtitles via `--sub-file`, and wrapping a long subtitle file as
             // a single oversized HLS segment produces unreliable cue timing
             // in some HLS demuxers (see issue #18).
-            let (_relay, local) = if self.is_android_player() {
-                relay_stream(stream).await?
+            let mut relay_source = stream.clone();
+            if prepared.is_some() {
+                // Prepared tracks already have their own in-memory server.
+                relay_source.subtitles.clear();
+            }
+            let (_relay, mut local) = if self.is_android_player() {
+                relay_stream(&relay_source).await?
             } else {
-                relay_stream_without_hls_subtitles(stream).await?
+                relay_stream_without_hls_subtitles(&relay_source).await?
             };
+            if prepared.is_some() {
+                local.subtitles = stream.subtitles.clone();
+            }
             debug!(
                 title = %title,
                 local_url = %local.url,
@@ -224,7 +244,7 @@ impl Player {
             );
             return self.play_inner(&local, title, true).await;
         }
-        self.play_inner(stream, title, false).await
+        self.play_inner(stream, title, prepared.is_some()).await
     }
 
     async fn play_inner(
@@ -260,20 +280,8 @@ impl Player {
             }
         }
 
-        // Keep the in-memory ASS server alive until the player exits. This also
-        // covers direct MP4/HLS URLs and streams already relayed by the GUI.
-        let prepared = if !stream.subtitles.is_empty()
-            && matches!(
-                self.options.kind,
-                PlayerKind::Mpv | PlayerKind::Iina | PlayerKind::Syncplay | PlayerKind::Vlc
-            ) {
-            Some(crate::hls_relay::prepare_desktop_subtitles(stream).await?)
-        } else {
-            None
-        };
-        let stream = prepared.as_ref().map_or(stream, |(_, local)| local);
         let mut command = Command::new(&self.options.executable);
-        let attached = self.options.no_detach || force_attached || prepared.is_some();
+        let attached = self.options.no_detach || force_attached;
         // sub-add supplies title/language metadata that bare ASS sidecar URLs
         // lack. Load before mpv selects tracks so slang and user scripts work.
         let subtitle_script = if !stream.subtitles.is_empty()
@@ -636,8 +644,8 @@ fn mpv_subtitle_script_body(tracks: &[SubtitleTrack]) -> Result<String> {
 mp.add_hook('on_preloaded', 50, function()
     for _, track in ipairs(tracks) do
         local flags = track.default and 'auto+default' or 'auto'
-        local ok, err = mp.command_native({{'sub-add', track.url, flags, track.title, track.lang}})
-        if not ok then mp.msg.warn('Could not load subtitle ' .. track.title .. ': ' .. tostring(err)) end
+        local _, err = mp.command_native({{'sub-add', track.url, flags, track.title, track.lang}})
+        if err then mp.msg.warn('Could not load subtitle ' .. track.title .. ': ' .. tostring(err)) end
     end
 end)
 "#
@@ -706,7 +714,7 @@ mod tests {
     use crate::{RequestHeaders, SubtitleTrack};
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "requires mpv with Lua support"]
+    #[ignore = "requires mpv with Lua support and FFmpeg"]
     async fn mpv_repaired_subtitles_have_metadata_and_can_be_selected() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use wiremock::{
@@ -764,29 +772,52 @@ mod tests {
         wav.extend(size.to_le_bytes());
         wav.resize(size as usize + 44, 0);
         std::fs::write(&audio, wav).unwrap();
-        source.url = audio.to_string_lossy().into_owned();
-        let (_relay, local) = crate::hls_relay::prepare_desktop_subtitles(&source)
-            .await
-            .unwrap();
-        let script = mpv_subtitle_script(&local.subtitles).unwrap();
+        let segment = directory.path().join("audio.ts");
+        assert!(
+            Command::new("ffmpeg")
+                .args(["-v", "error", "-i"])
+                .arg(&audio)
+                .args(["-c:a", "aac", "-f", "mpegts"])
+                .arg(&segment)
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        Mock::given(method("GET"))
+            .and(path("/audio.ts"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(std::fs::read(&segment).unwrap()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET")).and(path("/video.m3u8"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:3\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:2.0,\naudio.ts\n#EXT-X-ENDLIST\n"
+            )).mount(&server).await;
+        source.url = format!("{}/video.m3u8", server.uri());
+        source.hls = true;
         let socket = directory.path().join("mpv.sock");
-        let mut child = Command::new("mpv")
-            .args([
-                "--no-config",
-                "--vo=null",
-                "--ao=null",
-                "--pause",
-                "--idle=yes",
-                "--slang=rus",
-            ])
-            .arg(format!("--input-ipc-server={}", socket.display()))
-            .arg(format!("--scripts-append={}", script.path().display()))
-            .arg(&local.url)
-            .kill_on_drop(true)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let log = directory.path().join("mpv.log");
+        let executable = directory.path().join("mpv");
+        let quote =
+            |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        std::fs::write(&executable, format!(
+            "#!/bin/sh\nexec mpv --no-config --vo=null --ao=null --pause --idle=yes --slang=rus --input-ipc-server={} --log-file={} \"$@\" > /dev/null 2>&1\n",
+            quote(&socket), quote(&log),
+        )).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let player = Player::new(PlayerOptions {
+            executable,
+            kind: PlayerKind::Mpv,
+            no_detach: true,
+            exit_after_play: false,
+            force_hls_relay: true,
+        });
+        // Exercise the actual playback sequence, including HLS rewriting,
+        // rather than preparing tracks and launching mpv separately.
+        let playback = tokio::spawn(async move { player.play(&source, "Fixture").await });
         let stream = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await {
@@ -850,7 +881,23 @@ mod tests {
         })
         .await
         .unwrap();
-        child.kill().await.unwrap();
+        writer
+            .write_all(b"{\"command\":[\"quit\"]}\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), playback)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+            Some(0)
+        );
+        assert!(
+            !std::fs::read_to_string(&log)
+                .unwrap()
+                .contains("Could not load subtitle")
+        );
     }
 
     #[test]

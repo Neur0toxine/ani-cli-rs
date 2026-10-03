@@ -2,7 +2,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 
 use crate::{
-    AnikotoClient, AnikotoCzClient, CatalogProvider, HlsRelay, Player, PlayerOptions, SearchResult,
+    AnikotoClient, AnikotoCzClient, CatalogProvider, Player, PlayerOptions, SearchResult,
     StreamLink, TranslationType,
 };
 
@@ -21,7 +21,6 @@ pub enum GuiMessage {
     StreamsLoaded(Vec<StreamLink>),
     Error(String),
     PlayerStarted,
-    RelayStarted(HlsRelay),
 }
 
 pub struct GuiState {
@@ -44,9 +43,6 @@ pub struct GuiState {
 
     // Tokio runtime for async operations
     pub runtime: Runtime,
-
-    // HLS relay to keep alive during playback
-    pub active_relay: Option<HlsRelay>,
 
     // Library clients
     pub anikoto_client: Option<AnikotoClient>,
@@ -80,7 +76,6 @@ impl GuiState {
             message_tx: tx,
             message_rx: rx,
             runtime,
-            active_relay: None,
             anikoto_client: AnikotoClient::new().ok(),
             anikoto_cz_client: AnikotoCzClient::new().ok(),
             player: Player::new(PlayerOptions::default_player()), // GUI uses default force_hls_relay=false

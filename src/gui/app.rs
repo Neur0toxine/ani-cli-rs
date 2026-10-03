@@ -5,7 +5,6 @@ use egui_material_icons::icons::*;
 use crate::{
     AniError, CatalogProvider, StreamLink,
     gui::state::{GuiMessage, GuiState, LoadingState},
-    relay_stream_without_hls_subtitles, requires_hls_relay,
 };
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(255, 145, 45);
@@ -189,29 +188,9 @@ impl AniGuiApp {
     fn start_playback(&self, stream: StreamLink, title: String) {
         let tx = self.state.message_sender();
         let player = self.state.player.clone();
-        let stream_ref = stream.clone();
 
         self.state.runtime.spawn(async move {
-            let result = if requires_hls_relay(&stream_ref) {
-                match relay_stream_without_hls_subtitles(&stream_ref).await {
-                    Ok((relay, local)) => {
-                        let _ = tx.send(GuiMessage::RelayStarted(relay));
-
-                        player.play(&local, &title).await
-                    }
-
-                    Err(e) => {
-                        let _ = tx.send(GuiMessage::Error(format!(
-                            "Failed to start HLS relay: {}",
-                            e
-                        )));
-
-                        return;
-                    }
-                }
-            } else {
-                player.play(&stream_ref, &title).await
-            };
+            let result = player.play(&stream, &title).await;
 
             match result {
                 Ok(_) => {
@@ -253,10 +232,6 @@ impl AniGuiApp {
 
                 GuiMessage::PlayerStarted => {
                     self.state.loading_state = LoadingState::Idle;
-                }
-
-                GuiMessage::RelayStarted(relay) => {
-                    self.state.active_relay = Some(relay);
                 }
             }
         }
