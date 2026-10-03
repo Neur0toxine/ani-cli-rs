@@ -14,7 +14,6 @@ use clap::{
     builder::styling::{AnsiColor, Color, Style},
 };
 use dialoguer::{FuzzySelect, Input, MultiSelect, Select, theme::ColorfulTheme};
-use semver::Version;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
@@ -521,11 +520,6 @@ async fn display_next_episode_schedule(query: &str) -> Result<()> {
         println!("---");
     }
     Ok(())
-}
-
-#[derive(serde::Deserialize)]
-struct GithubRelease {
-    tag_name: String,
 }
 
 fn schedule_lines(anime: &ScheduleAnime) -> Vec<String> {

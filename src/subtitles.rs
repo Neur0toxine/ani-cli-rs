@@ -562,6 +562,40 @@ fn render_text(payload: &str, rules: &[CssRule], webvtt: bool) -> Result<String>
     Ok(output)
 }
 
+pub(crate) fn language_code(label: &str) -> &'static str {
+    let normalized = label.to_lowercase();
+    let label = normalized
+        .split(['(', '[', '-', '_'])
+        .next()
+        .unwrap_or(&normalized)
+        .trim();
+    match label {
+        "english" | "en" | "eng" => "eng",
+        "polish" | "polski" | "pl" | "pol" => "pol",
+        "spanish" | "español" | "espanol" | "es" | "spa" => "spa",
+        "portuguese" | "português" | "portugues" | "pt" | "por" => "por",
+        "french" | "français" | "francais" | "fr" | "fra" => "fra",
+        "german" | "deutsch" | "de" | "deu" => "deu",
+        "italian" | "italiano" | "it" | "ita" => "ita",
+        "japanese" | "日本語" | "ja" | "jpn" => "jpn",
+        "korean" | "한국어" | "ko" | "kor" => "kor",
+        "chinese" | "中文" | "zh" | "zho" => "zho",
+        "arabic" | "العربية" | "ar" | "ara" => "ara",
+        "russian" | "русский" | "ru" | "rus" => "rus",
+        "ukrainian" | "українська" | "uk" | "ukr" => "ukr",
+        "turkish" | "türkçe" | "turkce" | "tr" | "tur" => "tur",
+        "indonesian" | "bahasa indonesia" | "id" | "ind" => "ind",
+        "vietnamese" | "tiếng việt" | "tieng viet" | "vi" | "vie" => "vie",
+        "thai" | "ไทย" | "th" | "tha" => "tha",
+        "hindi" | "हिन्दी" | "hi" | "hin" => "hin",
+        "dutch" | "nederlands" | "nl" | "nld" => "nld",
+        "czech" | "čeština" | "cestina" | "cs" | "ces" => "ces",
+        "romanian" | "română" | "romana" | "ro" | "ron" => "ron",
+        "hungarian" | "magyar" | "hu" | "hun" => "hun",
+        _ => "und",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

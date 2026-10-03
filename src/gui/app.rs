@@ -748,17 +748,17 @@ impl AniGuiApp {
                             .size(15.0),
                     );
 
-                    if ui.add_sized([width, 42.0], button).clicked() {
-                        if let (Some(stream), Some(show)) = (
+                    if ui.add_sized([width, 42.0], button).clicked()
+                        && let (Some(stream), Some(show)) = (
                             self.state.selected_stream.clone(),
                             self.state.selected_show.clone(),
-                        ) {
-                            self.state.error_message = None;
+                        )
+                    {
+                        self.state.error_message = None;
 
-                            self.state.loading_state = LoadingState::StartingPlayer;
+                        self.state.loading_state = LoadingState::StartingPlayer;
 
-                            self.start_playback(stream, show.name);
-                        }
+                        self.start_playback(stream, show.name);
                     }
                 });
             });

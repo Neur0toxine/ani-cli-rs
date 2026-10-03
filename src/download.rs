@@ -157,7 +157,10 @@ fn subtitle_mux_args(
             format!("-metadata:s:s:{index}"),
             format!("title={}", subtitle.label),
             format!("-metadata:s:s:{index}"),
-            format!("language={}", subtitle_language_code(&subtitle.label)),
+            format!(
+                "language={}",
+                crate::subtitles::language_code(&subtitle.label)
+            ),
             format!("-disposition:s:{index}"),
             if Some(index) == default_index || (default_index.is_none() && index == 0) {
                 "default".into()
@@ -168,40 +171,6 @@ fn subtitle_mux_args(
     }
     args.push(output.to_string_lossy().into_owned());
     args
-}
-
-fn subtitle_language_code(label: &str) -> &'static str {
-    let normalized = label.to_ascii_lowercase();
-    let label = normalized
-        .split(['(', '[', '-', '_'])
-        .next()
-        .unwrap_or(&normalized)
-        .trim();
-    match label {
-        "english" | "en" => "eng",
-        "polish" | "polski" | "pl" => "pol",
-        "spanish" | "español" | "espanol" | "es" => "spa",
-        "portuguese" | "português" | "portugues" | "pt" => "por",
-        "french" | "français" | "francais" | "fr" => "fra",
-        "german" | "deutsch" | "de" => "deu",
-        "italian" | "italiano" | "it" => "ita",
-        "japanese" | "日本語" | "ja" => "jpn",
-        "korean" | "한국어" | "ko" => "kor",
-        "chinese" | "中文" | "zh" => "zho",
-        "arabic" | "العربية" | "ar" => "ara",
-        "russian" | "русский" | "ru" => "rus",
-        "ukrainian" | "українська" | "uk" => "ukr",
-        "turkish" | "türkçe" | "turkce" | "tr" => "tur",
-        "indonesian" | "bahasa indonesia" | "id" => "ind",
-        "vietnamese" | "tiếng việt" | "tieng viet" | "vi" => "vie",
-        "thai" | "ไทย" | "th" => "tha",
-        "hindi" | "हिन्दी" | "hi" => "hin",
-        "dutch" | "nederlands" | "nl" => "nld",
-        "czech" | "čeština" | "cestina" | "cs" => "ces",
-        "romanian" | "română" | "romana" | "ro" => "ron",
-        "hungarian" | "magyar" | "hu" => "hun",
-        _ => "und",
-    }
 }
 
 async fn download_stream_inner(stream: &StreamLink, options: &DownloadOptions) -> Result<PathBuf> {
@@ -818,8 +787,11 @@ mod tests {
 
     #[test]
     fn subtitle_labels_map_to_mp4_language_codes() {
-        assert_eq!(subtitle_language_code("English (CC)"), "eng");
-        assert_eq!(subtitle_language_code("Português-BR"), "por");
-        assert_eq!(subtitle_language_code("Unknown Provider Label"), "und");
+        assert_eq!(crate::subtitles::language_code("English (CC)"), "eng");
+        assert_eq!(crate::subtitles::language_code("Português-BR"), "por");
+        assert_eq!(
+            crate::subtitles::language_code("Unknown Provider Label"),
+            "und"
+        );
     }
 }

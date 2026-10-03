@@ -54,6 +54,12 @@ pub struct GuiState {
     pub player: Player,
 }
 
+impl Default for GuiState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GuiState {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();

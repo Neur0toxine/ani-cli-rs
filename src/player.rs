@@ -274,7 +274,28 @@ impl Player {
         let stream = prepared.as_ref().map_or(stream, |(_, local)| local);
         let mut command = Command::new(&self.options.executable);
         let attached = self.options.no_detach || force_attached || prepared.is_some();
-        let args = self.command_args_inner(stream, title, attached);
+        // sub-add supplies title/language metadata that bare ASS sidecar URLs
+        // lack. Load before mpv selects tracks so slang and user scripts work.
+        let subtitle_script = if !stream.subtitles.is_empty()
+            && matches!(
+                self.options.kind,
+                PlayerKind::Mpv | PlayerKind::Iina | PlayerKind::Syncplay
+            ) {
+            Some(mpv_subtitle_script(&stream.subtitles)?)
+        } else {
+            None
+        };
+        let mut args = self.command_args_inner(stream, title, attached);
+        if let Some(script) = &subtitle_script {
+            args.retain(|arg| !arg.starts_with("--sub-file="));
+            let option = format!("--scripts-append={}", script.path().display());
+            // mpv's media URL is last; IINA/Syncplay's raw options follow `--`.
+            if self.options.kind == PlayerKind::Mpv {
+                args.insert(args.len() - 1, option);
+            } else {
+                args.push(option);
+            }
+        }
         info!(
             title = %title,
             executable = %self.options.executable.display(),
@@ -581,6 +602,48 @@ async fn wait_for_android_player() -> Result<()> {
     Ok(())
 }
 
+fn mpv_subtitle_script(tracks: &[SubtitleTrack]) -> Result<tempfile::NamedTempFile> {
+    let mut script = tempfile::Builder::new()
+        .prefix("ani-subtitles-")
+        .suffix(".lua")
+        .tempfile()?;
+    script.write_all(mpv_subtitle_script_body(tracks)?.as_bytes())?;
+    script.flush()?;
+    Ok(script)
+}
+
+fn mpv_subtitle_script_body(tracks: &[SubtitleTrack]) -> Result<String> {
+    let tracks: Vec<_> = tracks
+        .iter()
+        .map(|track| {
+            serde_json::json!({
+                "url": track.url,
+                "title": track.label,
+                "lang": crate::subtitles::language_code(&track.label),
+                "default": track.default,
+            })
+        })
+        .collect();
+    let json = serde_json::to_string(&tracks)?;
+    // A Lua long string preserves JSON escapes and Unicode. Choose a delimiter
+    // absent from provider data so labels/URLs can never become script code.
+    let mut delimiter = "=".to_owned();
+    while json.contains(&format!("]{delimiter}]")) {
+        delimiter.push('=');
+    }
+    Ok(format!(
+        r#"local tracks = require('mp.utils').parse_json([{delimiter}[{json}]{delimiter}])
+mp.add_hook('on_preloaded', 50, function()
+    for _, track in ipairs(tracks) do
+        local flags = track.default and 'auto+default' or 'auto'
+        local ok, err = mp.command_native({{'sub-add', track.url, flags, track.title, track.lang}})
+        if not ok then mp.msg.warn('Could not load subtitle ' .. track.title .. ': ' .. tostring(err)) end
+    end
+end)
+"#
+    ))
+}
+
 fn mpv_options(stream: &StreamLink, title: &str, referer: &str) -> Vec<String> {
     let mut args = vec![
         "--tls-verify=no".into(),
@@ -590,10 +653,8 @@ fn mpv_options(stream: &StreamLink, title: &str, referer: &str) -> Vec<String> {
         args.push(format!("--referrer={referer}"));
     }
     append_mpv_headers(&mut args, stream);
-    // mpv titles external subtitle tracks after the URL basename, so relayed
-    // tracks already display their language. It also selects the most
-    // recently added external track, so the provider's default track is
-    // appended last to become the initially selected one.
+    // Raw arguments remain usable without preparing subtitles. Playback
+    // replaces these sidecars with a hook that supplies title/language metadata.
     let mut subtitles: Vec<&SubtitleTrack> = stream.subtitles.iter().collect();
     subtitles.sort_by_key(|track| track.default);
     for track in subtitles {
@@ -643,6 +704,168 @@ fn env_bool(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::{RequestHeaders, SubtitleTrack};
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires mpv with Lua support"]
+    async fn mpv_repaired_subtitles_have_metadata_and_can_be_selected() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let server = MockServer::start().await;
+        for locale in ["english", "russian"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{locale}.vtt")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(
+                        "WEBVTT\n\n00:00.000 --> 00:02.000\n<b>First\n\nSecond</b>\n",
+                    ),
+                )
+                .mount(&server)
+                .await;
+        }
+        let mut source = StreamLink {
+            url: "https://example.invalid/video.mp4".into(),
+            resolution: "auto".into(),
+            hls: false,
+            provider: "test".into(),
+            downloadable: false,
+            headers: RequestHeaders::default(),
+            subtitles: vec![
+                SubtitleTrack {
+                    label: "English".into(),
+                    url: format!("{}/english.vtt", server.uri()),
+                    default: true,
+                },
+                SubtitleTrack {
+                    label: "Русский".into(),
+                    url: format!("{}/russian.vtt", server.uri()),
+                    default: false,
+                },
+            ],
+        };
+        let directory = tempfile::tempdir().unwrap();
+        // Two seconds of silent PCM provide a deterministic, offline media file.
+        let audio = directory.path().join("audio.wav");
+        let size = 8000u32 * 2 * 2;
+        let mut wav = b"RIFF".to_vec();
+        wav.extend((size + 36).to_le_bytes());
+        wav.extend(b"WAVEfmt ");
+        wav.extend(16u32.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(1u16.to_le_bytes());
+        wav.extend(8000u32.to_le_bytes());
+        wav.extend(16000u32.to_le_bytes());
+        wav.extend(2u16.to_le_bytes());
+        wav.extend(16u16.to_le_bytes());
+        wav.extend(b"data");
+        wav.extend(size.to_le_bytes());
+        wav.resize(size as usize + 44, 0);
+        std::fs::write(&audio, wav).unwrap();
+        source.url = audio.to_string_lossy().into_owned();
+        let (_relay, local) = crate::hls_relay::prepare_desktop_subtitles(&source)
+            .await
+            .unwrap();
+        let script = mpv_subtitle_script(&local.subtitles).unwrap();
+        let socket = directory.path().join("mpv.sock");
+        let mut child = Command::new("mpv")
+            .args([
+                "--no-config",
+                "--vo=null",
+                "--ao=null",
+                "--pause",
+                "--idle=yes",
+                "--slang=rus",
+            ])
+            .arg(format!("--input-ipc-server={}", socket.display()))
+            .arg(format!("--scripts-append={}", script.path().display()))
+            .arg(&local.url)
+            .kill_on_drop(true)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(stream) = tokio::net::UnixStream::connect(&socket).await {
+                    break stream;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        let tracks = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                writer
+                    .write_all(
+                        b"{\"command\":[\"get_property\",\"track-list\"],\"request_id\":1}\n",
+                    )
+                    .await
+                    .unwrap();
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    if response["request_id"] == 1 {
+                        let tracks: Vec<_> = response["data"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter(|track| track["type"] == "sub")
+                            .cloned()
+                            .collect();
+                        if tracks.len() == 2 {
+                            return tracks;
+                        }
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(tracks[0]["title"], "English");
+        assert_eq!(tracks[0]["lang"], "eng");
+        assert_eq!(tracks[1]["title"], "Русский");
+        assert_eq!(tracks[1]["lang"], "rus");
+        assert_eq!(
+            tracks[1]["selected"], true,
+            "slang must override the provider default"
+        );
+        assert!(tracks.iter().all(|track| track["codec"] == "ass"));
+        writer.write_all(b"{\"command\":[\"set_property\",\"sid\",1],\"request_id\":2}\n{\"command\":[\"get_property\",\"sid\"],\"request_id\":3}\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(line) = lines.next_line().await.unwrap() {
+                let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if response["request_id"] == 3 {
+                    assert_eq!(response["data"], 1);
+                    return;
+                }
+            }
+            panic!("mpv IPC closed before confirming subtitle selection");
+        })
+        .await
+        .unwrap();
+        child.kill().await.unwrap();
+    }
+
+    #[test]
+    fn subtitle_script_keeps_provider_data_out_of_lua_code() {
+        let script = mpv_subtitle_script_body(&[SubtitleTrack {
+            label: "Русский ]=] ' \\\"\n".into(),
+            url: "https://example.invalid/sub?x=]=]".into(),
+            default: true,
+        }])
+        .unwrap();
+        assert!(script.contains("parse_json([==["));
+        assert!(script.contains(r#"\n"#));
+        assert!(script.contains(r#""lang":"und""#));
+    }
+
     #[test]
     fn mpv_arguments_preserve_referrer_as_one_argument() {
         let player = Player::new(PlayerOptions {
@@ -713,8 +936,7 @@ mod tests {
         assert_eq!(sub_files.len(), 3);
         assert!(sub_files[0].ends_with("/Arabic"));
         assert!(sub_files[1].ends_with("/Spanish"));
-        // mpv selects the most recently added external track, so the default
-        // language has to be the final --sub-file argument.
+        // Keep the existing ordering for callers using raw command arguments.
         assert!(sub_files[2].ends_with("/English"));
     }
 

@@ -197,8 +197,17 @@ fn provider_weight(value: &str) -> i32 {
 
 pub(crate) fn sort_streams(streams: &mut [StreamLink]) {
     streams.sort_by(|a, b| {
-        provider_weight(&b.provider)
-            .cmp(&provider_weight(&a.provider))
+        // Separate tracks allow locale selection; H-SUB captions are burned
+        // into the video. Keep those streams as a fallback, not the default.
+        a.subtitles
+            .is_empty()
+            .cmp(&b.subtitles.is_empty())
+            .then_with(|| {
+                a.provider
+                    .starts_with("H-SUB")
+                    .cmp(&b.provider.starts_with("H-SUB"))
+            })
+            .then_with(|| provider_weight(&b.provider).cmp(&provider_weight(&a.provider)))
             .then_with(|| resolution_weight(&b.resolution).cmp(&resolution_weight(&a.resolution)))
             .then_with(|| b.hls.cmp(&a.hls))
             .then_with(|| a.provider.cmp(&b.provider))
@@ -313,6 +322,34 @@ mod tests {
             SearchSort::from_str("most-viewed").unwrap(),
             SearchSort::MostViewed
         );
+    }
+
+    #[test]
+    fn selectable_subtitles_and_soft_sub_servers_precede_hard_sub_fallbacks() {
+        let make = |provider: &str| StreamLink {
+            url: format!("https://example.invalid/{provider}"),
+            resolution: "1080p".into(),
+            hls: true,
+            provider: provider.into(),
+            downloadable: true,
+            headers: RequestHeaders::default(),
+            subtitles: vec![],
+        };
+        let mut tracked = make("External tracks");
+        tracked.subtitles.push(SubtitleTrack {
+            label: "English".into(),
+            url: "https://example.invalid/en.vtt".into(),
+            default: true,
+        });
+        let mut streams = vec![make("H-SUB · HD-1"), make("SUB · VidPlay-1"), tracked];
+        sort_streams(&mut streams);
+        assert_eq!(
+            choose_quality(&streams, "1080p").unwrap().provider,
+            "External tracks"
+        );
+        assert_eq!(streams[1].provider, "SUB · VidPlay-1");
+        assert_eq!(streams[2].provider, "H-SUB · HD-1");
+        assert!(choose_quality(&streams[2..], "best").is_some());
     }
 
     #[test]

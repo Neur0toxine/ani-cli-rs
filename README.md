@@ -58,6 +58,10 @@ Unlike the original Bash project, the executable is intentionally named `ani-cli
 * 🤖 Scriptable commands with JSON output
 * 📚 Reusable Rust library API
 
+Stream selection prefers separate subtitle tracks and soft-sub servers, with hard-sub servers retained as fallbacks. Hard-sub captions are burned into the video and cannot be switched or disabled in the player.
+
+Desktop playback repairs and converts provider subtitles to ASS before loading them. mpv, IINA, and Syncplay receive selectable tracks with explicit titles and language codes, so language preferences (`slang` in mpv) and subtitle selectors can identify them. The provider default is used by mpv’s normal track selection when no preferred language wins. Converted subtitles stay in memory; a temporary Lua loader is removed when playback ends.
+
 ---
 
 ## Community
